@@ -1,0 +1,191 @@
+#!/usr/bin/python3
+
+import hashlib
+import sys
+import argparse
+import subprocess
+import venv
+import os
+from pathlib import Path
+
+
+DEFAULT_PYENV_PATH='/usr/'
+
+
+class FatalError(Exception):
+    def __init__(self, msg):
+        super().__init__()
+        self.msg = msg
+
+
+def parent_iter(path):
+    yield path
+    yield from path.parents
+
+
+def env_name(path):
+    hash = hashlib.sha256()
+    hash.update(str(path).encode('utf8'))
+    return hash.hexdigest()
+
+
+def find_env_path(env_roots, paths):
+    for path in paths:
+        for root in env_roots:
+            env_path = root.joinpath(env_name(path))
+            if env_path.exists():
+                return env_path
+
+    raise FatalError('could not find a matching venv')
+
+
+def make_binary_path(path, binary):
+    return path.joinpath('bin', binary)
+
+
+def get_opts(argv):
+    parser = argparse.ArgumentParser(prog=argv[0])
+    subparsers = parser.add_subparsers(dest='action')
+
+    bin_parser = subparsers.add_parser('bin')
+    group = bin_parser.add_mutually_exclusive_group(required=False)
+    group.add_argument('-b', '--binary')
+    group.add_argument('-a', action='store_true', dest='activate')
+    bin_parser.add_argument('-R', '--recursive', action='store_true', default=False)
+    bin_parser.add_argument('path', nargs='?')
+
+    gen_parser = subparsers.add_parser('name')
+    gen_parser.add_argument('path', nargs='?')
+
+    build_parser = subparsers.add_parser('build')
+    build_parser.add_argument('--system-site-packages', default=False,
+                        action='store_true', dest='system_site',
+                        help='Give the virtual environment access to the '
+                             'system site-packages dir.')
+    if os.name == 'nt':
+        use_symlinks = False
+    else:
+        use_symlinks = True
+
+    build_group = build_parser.add_mutually_exclusive_group()
+    build_group.add_argument('--symlinks', default=use_symlinks,
+                       action='store_true', dest='symlinks',
+                       help='Try to use symlinks rather than copies, '
+                            'when symlinks are not the default for '
+                            'the platform.')
+    build_group.add_argument('--copies', default=not use_symlinks,
+                       action='store_false', dest='symlinks',
+                       help='Try to use copies rather than symlinks, '
+                            'even when symlinks are the default for '
+                            'the platform.')
+    build_parser.add_argument('--clear', default=False, action='store_true',
+                        dest='clear', help='Delete the contents of the '
+                                           'environment directory if it '
+                                           'already exists, before '
+                                           'environment creation.')
+    build_parser.add_argument('--upgrade', default=False, action='store_true',
+                        dest='upgrade', help='Upgrade the environment '
+                                           'directory to use this version '
+                                           'of Python, assuming Python '
+                                           'has been upgraded in-place.')
+    build_parser.add_argument('--without-pip', dest='with_pip',
+                        default=True, action='store_false',
+                        help='Skips installing or upgrading pip in the '
+                             'virtual environment (pip is bootstrapped '
+                             'by default)')
+    build_parser.add_argument('--prompt',
+                        help='Provides an alternative prompt prefix for '
+                             'this environment.')
+
+    build_parser.add_argument('--install-packages', default=False, action='store_true', dest='install_packages')
+    build_parser.add_argument('directory')
+    build_parser.add_argument('path', nargs='?')
+
+    opts = parser.parse_args(argv[1:])
+
+
+    if opts.action == 'bin':
+        raw_pyenv_paths = os.environ.get('PYENV_PATH', DEFAULT_PYENV_PATH)
+        opts.pyenv_paths = tuple(Path(p).resolve() for p in raw_pyenv_paths.split(':'))
+
+        opts.action = 'find_binary'
+        if opts.binary is None:
+            if opts.activate is True:
+                opts.binary = 'activate'
+            else:
+                opts.binary = 'python'
+
+        del opts.activate
+
+    elif opts.action == 'name':
+        opts.action = 'print_path'
+
+    elif opts.action == 'build':
+        if opts.upgrade and options.clear:
+            raise ValueError('you cannot supply --upgrade and --clear together.')
+
+        opts.action = 'build_venv'
+
+        path = Path(opts.directory)
+        opts.directory = path.resolve()
+
+    if opts.path is None:
+        opts.path = Path.cwd()
+    else:
+        path = Path(opts.path)
+        opts.path = path.resolve()
+
+    return opts
+
+
+def print_binary_path(opts):
+    paths = parent_iter(opts.path) if opts.recursive else (opts.path,)
+    env_path = find_env_path(
+        opts.pyenv_paths,
+        paths
+    )
+    binary_path = make_binary_path(env_path, opts.binary)
+    sys.stdout.write(str(binary_path))
+
+
+def print_path(opts):
+    sys.stdout.write(str(env_name(opts.path)))
+
+
+def make_venv(opts):
+    env_root = Path.home().joinpath('.pyenv')
+    env_path = opts.directory.joinpath(env_name(opts.path))
+
+    builder = venv.EnvBuilder(system_site_packages=opts.system_site,
+                         clear=opts.clear,
+                         symlinks=opts.symlinks,
+                         upgrade=opts.upgrade,
+                         with_pip=opts.with_pip,
+                         prompt=opts.prompt)
+
+    install_packages = False
+
+    if opts.install_packages and opts.with_pip:
+        packages_manifest = opts.path.joinpath('packages')
+        if packages_manifest.exists():
+            install_packages = True
+
+    builder.create(env_path)
+    if install_packages:
+        subprocess.run([env_path.joinpath('bin', 'pip'), 'install', '--requirement', packages_manifest])
+
+
+if __name__ == '__main__':
+    try:
+        opts = get_opts(sys.argv)
+        if opts.action == 'print_path':
+            print_path(opts)
+        elif opts.action == 'find_binary':
+            print_binary_path(opts)
+        elif opts.action == 'build_venv':
+            make_venv(opts)
+
+        sys.exit(0)
+    except FatalError as exc:
+        sys.stderr.write(exc.msg + '\n')
+        sys.exit(1)

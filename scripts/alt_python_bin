@@ -1,0 +1,11 @@
+#!/bin/bash
+
+
+REAL=`pyenv bin -b "$2" "$1"`
+
+if [ $? -eq 0 ]
+then
+    "$REAL" $@
+else
+    /usr/bin/env python $@
+fi

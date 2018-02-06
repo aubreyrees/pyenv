@@ -1,0 +1,13 @@
+#!/bin/bash
+
+
+REAL=`pyenv bin "$1"`
+
+if [ $? -eq 0 ]
+then
+    echo "$REAL"
+else
+    echo "python"
+fi
+
+#$REAL $@
