@@ -1,13 +1,17 @@
 #!/bin/bash
 
 
-REAL=`pyenv bin "$1"`
+REAL=`pyenv bin --pybinary "$1" "$2"`
 
 if [ $? -eq 0 ]
 then
-    echo "$REAL"
+    PY="$REAL/python"
+    if [ -f "$PY" ]
+    then
+        "$PY"
+    fi
 else
-    echo "python"
+    "/usr/bin/env python"
 fi
 
 #$REAL $@

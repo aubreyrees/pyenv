@@ -9,125 +9,250 @@ import os
 from pathlib import Path
 
 
-DEFAULT_PYENV_PATH='/usr/'
+ACTIVATE_PATH='/etc/pyenv/activate'
 
 
 class FatalError(Exception):
+    """
+    Exception used by script to abort execution
+    """
     def __init__(self, msg):
         super().__init__()
         self.msg = msg
 
 
+def get_executable():
+    if sys.platform == 'darwin' and '__PYVENV_LAUNCHER__' in env:
+        return os.environ['__PYVENV_LAUNCHER__']
+    else:
+        return Path(sys.executable).resolve().name
+
+
+def get_bin_name():
+    return 'Scripts' if sys.platform == 'win32' else 'bin'
+
+
+def make_activate_script(path, prompt, bin_name):
+    text = open(path, 'r').read()
+    text = text.replace('__VENV_PROMPT__', prompt)
+    text = text.replace('__VENV_BIN_NAME__', bin_name)
+    return text
+
+
+class Engine:
+    def __init__(self, root):
+        self._root = root
+
+    @classmethod
+    def find_path_match(cls, pybinary, roots, paths):
+        """
+        Finds the find env root in `env_roots` that contains
+        the first path in `paths`. Env roots are checked in
+        order - the first one in the sequence will be selected
+        """
+        for path in paths:
+            for root in roots:
+                candidate = cls(root)
+                if candidate.has_linked_env(pybinary, path):
+                    return candidate, path
+
+        return None, None
+
+    def has_linked_env(self, path):
+        raise NotImplementedError()
+
+    def make_env(self, path, **options):
+        raise NotImplementedError()
+
+
+class VenvV1(Engine):
+    def _assoc_path(self, path):
+        """
+        Maps path `path` to the suitable virtual env name
+        """
+        hash = hashlib.sha256()
+        hash.update(str(path).encode('utf8'))
+        return self._root.joinpath('atst_v1_%s' % hash.hexdigest())
+
+    def has_linked_env(self, pybinary, path):
+        assoc_path = self._assoc_path(path)
+        return assoc_path.joinpath(pybinary).exists()
+
+    def binary_path(self, pybinary, path):
+        """
+        Return a path for the binary named `binary` that
+        is the in the bin directory of the virtual env
+        `path`
+        """
+        assoc_path = self._assoc_path(path)
+        bin_path = assoc_path.joinpath(pybinary, get_bin_name())
+
+        if bin_path.is_dir():
+            return bin_path
+        else:
+            return None
+
+    def make_env(self, pybinary, path,
+            system_site_packages=False,
+            symlinks=False,
+            copies=False,
+            with_pip=True,
+            prompt=None
+        ):
+        """
+        Maps path `path` to the suitable virtual env name
+        """
+        assoc_path = self._assoc_path(path)
+        self._root.mkdir(exist_ok=True)
+        assoc_path.mkdir(exist_ok=True)
+
+        venv_path = assoc_path.joinpath(pybinary)
+
+        cmd = ['/usr/bin/env', pybinary, '-m', 'venv', '--clear']
+        if system_site_packages is True:
+            cmd.append('--system-site-packages')
+
+        if symlinks is True:
+            cmd.append('--symlinks')
+
+        if copies is True:
+            cmd.append('--copies')
+
+        if with_pip is False:
+            cmd.append('--without-pip')
+
+        cmd.append(str(venv_path))
+
+        subprocess.run(cmd)
+
+        binname = get_bin_name()
+        binpath = venv_path.joinpath(binname)
+
+        script = make_activate_script(
+            path=ACTIVATE_PATH,
+            prompt=prompt,
+            bin_name=binname,
+        )
+
+        open(binpath.joinpath('activate'), 'w').write(script)
+
+
+DEFAULT_ENGINE = VenvV1
+
+
 def parent_iter(path):
+    """
+    Iterator that yields path `path` and then each of `path`s
+    parents, returning the nearest ancestor and ending with
+    the furthest
+    """
     yield path
     yield from path.parents
 
 
-def env_name(path):
-    hash = hashlib.sha256()
-    hash.update(str(path).encode('utf8'))
-    return hash.hexdigest()
-
-
-def find_env_path(env_roots, paths):
-    for path in paths:
-        for root in env_roots:
-            env_path = root.joinpath(env_name(path))
-            if env_path.exists():
-                return env_path
-
-    raise FatalError('could not find a matching venv')
-
-
-def make_binary_path(path, binary):
-    return path.joinpath('bin', binary)
-
-
 def get_opts(argv):
+    """
+    Parse command line arguments
+    """
     parser = argparse.ArgumentParser(prog=argv[0])
     subparsers = parser.add_subparsers(dest='action')
 
-    bin_parser = subparsers.add_parser('bin')
-    group = bin_parser.add_mutually_exclusive_group(required=False)
-    group.add_argument('-b', '--binary')
-    group.add_argument('-a', action='store_true', dest='activate')
-    bin_parser.add_argument('-R', '--recursive', action='store_true', default=False)
-    bin_parser.add_argument('path', nargs='?')
+    bin_parser = subparsers.add_parser(
+        'bin',
+        help='Attempt to find a binary in a virtual enviroment associated'
+             ' with a path.'
+    )
+    bin_parser.add_argument(
+        '-R', '--recursive',
+        action='store_true',
+        default=False,
+        help="If set the path and all it's ancestors will be searched"
+    )
+    bin_parser.add_argument(
+        '--pybinary',
+        default=None,
+    )
+    bin_parser.add_argument(
+        'path',
+        metavar='PATH',
+        nargs='?',
+        help='The path associated with a the virtual enviroment'
+    )
 
-    gen_parser = subparsers.add_parser('name')
-    gen_parser.add_argument('path', nargs='?')
-
-    build_parser = subparsers.add_parser('build')
-    build_parser.add_argument('--system-site-packages', default=False,
-                        action='store_true', dest='system_site',
-                        help='Give the virtual environment access to the '
-                             'system site-packages dir.')
+    build_parser = subparsers.add_parser(
+        'build',
+        help='create a new virtual enviroment associated with a path.'
+    )
+    build_parser.add_argument(
+        '--pybinary',
+        default=None,
+    )
+    build_parser.add_argument(
+        '--system-site-packages',
+        default=False,
+        action='store_true',
+        dest='system_site',
+        help='Give the virtual environment access to the system site-packages'
+             ' dir.'
+    )
     if os.name == 'nt':
         use_symlinks = False
     else:
         use_symlinks = True
 
     build_group = build_parser.add_mutually_exclusive_group()
-    build_group.add_argument('--symlinks', default=use_symlinks,
-                       action='store_true', dest='symlinks',
-                       help='Try to use symlinks rather than copies, '
-                            'when symlinks are not the default for '
-                            'the platform.')
-    build_group.add_argument('--copies', default=not use_symlinks,
-                       action='store_false', dest='symlinks',
-                       help='Try to use copies rather than symlinks, '
-                            'even when symlinks are the default for '
-                            'the platform.')
-    build_parser.add_argument('--clear', default=False, action='store_true',
-                        dest='clear', help='Delete the contents of the '
-                                           'environment directory if it '
-                                           'already exists, before '
-                                           'environment creation.')
-    build_parser.add_argument('--upgrade', default=False, action='store_true',
-                        dest='upgrade', help='Upgrade the environment '
-                                           'directory to use this version '
-                                           'of Python, assuming Python '
-                                           'has been upgraded in-place.')
-    build_parser.add_argument('--without-pip', dest='with_pip',
-                        default=True, action='store_false',
-                        help='Skips installing or upgrading pip in the '
-                             'virtual environment (pip is bootstrapped '
-                             'by default)')
-    build_parser.add_argument('--prompt',
-                        help='Provides an alternative prompt prefix for '
-                             'this environment.')
-
-    build_parser.add_argument('--install-packages', default=False, action='store_true', dest='install_packages')
-    build_parser.add_argument('directory')
-    build_parser.add_argument('path', nargs='?')
+    build_group.add_argument(
+        '--symlinks',
+        default=use_symlinks,
+        action='store_true',
+        dest='symlinks',
+        help='Try to use symlinks rather than copies, when symlinks are not'
+             ' the default for the platform.'
+    )
+    build_group.add_argument(
+        '--copies',
+        default=not use_symlinks,
+        action='store_false',
+        dest='symlinks',
+        help='Try to use copies rather than symlinks, even when symlinks are'
+             ' the default for the platform.'
+    )
+    build_parser.add_argument(
+        '--rebuild',
+        default=False,
+        action='store_true',
+        dest='rebuild',
+        help='Regen the environment if it already'
+             ' exists, before environment creation.'
+    )
+    build_parser.add_argument(
+        '--without-pip',
+        dest='with_pip',
+        default=True,
+        action='store_false',
+        help='Skips installing or upgrading pip in the virtual environment'
+             ' (pip is bootstrapped by default)'
+    )
+    build_parser.add_argument(
+        '--prompt',
+        help='Provides an alternative prompt prefix for this environment.'
+    )
+    build_parser.add_argument(
+        'directory',
+        metavar='DIR',
+        help='The directory under which the new eniroment will be created.'
+    )
+    build_parser.add_argument(
+        'path',
+        nargs='?',
+        metavar='PATH',
+        help='The path to be associated with the new virtual enviroment.'
+    )
 
     opts = parser.parse_args(argv[1:])
 
-
-    if opts.action == 'bin':
-        raw_pyenv_paths = os.environ.get('PYENV_PATH', DEFAULT_PYENV_PATH)
-        opts.pyenv_paths = tuple(Path(p).resolve() for p in raw_pyenv_paths.split(':'))
-
-        opts.action = 'find_binary'
-        if opts.binary is None:
-            if opts.activate is True:
-                opts.binary = 'activate'
-            else:
-                opts.binary = 'python'
-
-        del opts.activate
-
-    elif opts.action == 'name':
-        opts.action = 'print_path'
-
-    elif opts.action == 'build':
-        if opts.upgrade and options.clear:
-            raise ValueError('you cannot supply --upgrade and --clear together.')
-
-        opts.action = 'build_venv'
-
-        path = Path(opts.directory)
-        opts.directory = path.resolve()
+    if opts.action is None:
+        raise FatalError('No subcommand specified.')
 
     if opts.path is None:
         opts.path = Path.cwd()
@@ -135,56 +260,70 @@ def get_opts(argv):
         path = Path(opts.path)
         opts.path = path.resolve()
 
+
+    if opts.pybinary is None:
+        opts.pybinary = get_executable()
+    else:
+        data = subprocess.check_output(['which', opts.pybinary])
+        text = data.decode('utf8').strip()
+        opts.pybinary = Path(text).resolve().name
+
+    if opts.action == 'bin':
+        raw_pyenv_paths = os.environ.get('PYENV_PATH', '')
+        opts.pyenv_paths = tuple(Path(p).resolve() for p in raw_pyenv_paths.split(':') if p)
+        if len(opts.pyenv_paths) == 0:
+            raise FatalError('No pyenv directories to seatch (is PYENV_PATH set?)')
+        opts.action = 'find_binary'
+
+    elif opts.action == 'build':
+        if not opts.prompt:
+            opts.prompt = opts.path.name
+
+        opts.action = 'build_venv'
+
+        path = Path(opts.directory)
+        opts.directory = path.resolve()
+
     return opts
 
 
-def print_binary_path(opts):
-    paths = parent_iter(opts.path) if opts.recursive else (opts.path,)
-    env_path = find_env_path(
-        opts.pyenv_paths,
-        paths
-    )
-    binary_path = make_binary_path(env_path, opts.binary)
-    sys.stdout.write(str(binary_path))
+def main(argv):
+    engine_cls = DEFAULT_ENGINE
+    opts = get_opts(argv)
+    if opts.action == 'find_binary':
+        to_match = list()
+        if opts.recursive:
+            to_match.extend(opts.path.parents)
+        to_match.append(opts.path)
 
+        engine, path = engine_cls.find_path_match(
+            opts.pybinary, opts.pyenv_paths, to_match
+        )
+        if engine is None:
+            raise FatalError('pyenv not found')
 
-def print_path(opts):
-    sys.stdout.write(str(env_name(opts.path)))
+        x = engine.binary_path(opts.pybinary, path)
+        sys.stdout.write(str(x))
 
+    elif opts.action == 'build_venv':
+        engine = engine_cls(opts.directory)
 
-def make_venv(opts):
-    env_root = Path.home().joinpath('.pyenv')
-    env_path = opts.directory.joinpath(env_name(opts.path))
-
-    builder = venv.EnvBuilder(system_site_packages=opts.system_site,
-                         clear=opts.clear,
-                         symlinks=opts.symlinks,
-                         upgrade=opts.upgrade,
-                         with_pip=opts.with_pip,
-                         prompt=opts.prompt)
-
-    install_packages = False
-
-    if opts.install_packages and opts.with_pip:
-        packages_manifest = opts.path.joinpath('packages')
-        if packages_manifest.exists():
-            install_packages = True
-
-    builder.create(env_path)
-    if install_packages:
-        subprocess.run([env_path.joinpath('bin', 'pip'), 'install', '--requirement', packages_manifest])
+        if opts.rebuild or not engine.has_linked_env(opts.pybinary, opts.path):
+            engine.make_env(
+               pybinary=opts.pybinary,
+               path=opts.path,
+               system_site_packages=opts.system_site,
+               symlinks=opts.symlinks,
+               with_pip=opts.with_pip,
+               prompt=opts.prompt,
+            )
+        else:
+            sys.stdout.write('Venv already exists\n')
 
 
 if __name__ == '__main__':
     try:
-        opts = get_opts(sys.argv)
-        if opts.action == 'print_path':
-            print_path(opts)
-        elif opts.action == 'find_binary':
-            print_binary_path(opts)
-        elif opts.action == 'build_venv':
-            make_venv(opts)
-
+        main(sys.argv)
         sys.exit(0)
     except FatalError as exc:
         sys.stderr.write(exc.msg + '\n')
